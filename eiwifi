@@ -1,0 +1,538 @@
+#!/usr/bin/env bash
+# eiwifi — Android/Termux WiFi doctor.
+# Measures the radio link, the local network and the internet path, then says
+# which one is actually holding you back and exactly what to change.
+#
+# Honest scope: an unprivileged Android app cannot change radio settings.
+# This tool diagnoses and prescribes; you (or your router) apply the fix.
+set -uo pipefail
+
+VERSION="1.0.0"
+PROG="eiwifi"
+
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+WLAN_IF="${EIWIFI_IF:-wlan0}"
+FAST_TOKEN='YXNkZmFzZGxmbnNkYWZoYXNkZmhrYWxm'
+
+# ---------- presentation ----------
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_R=$'\033[0m'; C_B=$'\033[1m'; C_D=$'\033[2m'
+  C_G=$'\033[32m'; C_Y=$'\033[33m'; C_RD=$'\033[31m'; C_C=$'\033[36m'
+else
+  C_R=''; C_B=''; C_D=''; C_G=''; C_Y=''; C_RD=''; C_C=''
+fi
+
+hr()   { printf '%s\n' "${C_D}────────────────────────────────────────────────────────────${C_R}"; }
+sect() { printf '\n%s[%s]%s %s\n' "$C_B" "$1" "$C_R" "$2"; }
+ok()   { printf '  %s✓%s %s\n' "$C_G" "$C_R" "$*"; }
+warn() { printf '  %s!%s %s\n' "$C_Y" "$C_R" "$*"; }
+bad()  { printf '  %s✗%s %s\n' "$C_RD" "$C_R" "$*"; }
+info() { printf '  %s\n' "$*"; }
+kv()   { printf '  %-12s %s\n' "$1" "$2"; }
+die()  { printf '%s\n' "$PROG": "$*" >&2; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+version_banner() {
+  printf '%s%s%s %s— Android WiFi doctor%s\n' "$C_B" "$PROG" "$C_R" "$C_D" "$C_R"
+  printf '%s%s%s\n' "$C_D" "  v$VERSION  ·  measures the link, finds the real bottleneck" "$C_R"
+}
+
+# ---------- json helpers (no jq dependency) ----------
+json_str() { # json_str KEY  (reads stdin) - case-insensitive key, string value
+  grep -oiE "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" 2>/dev/null | head -1 | \
+    sed -E 's/^[^:]*:[[:space:]]*"//; s/"$//'
+}
+json_num() { # json_num KEY  (reads stdin) - case-insensitive key, numeric value
+  grep -oiE "\"$1\"[[:space:]]*:[[:space:]]*-?[0-9]+(\.[0-9]+)?" 2>/dev/null | head -1 | \
+    sed -E 's/^[^:]*:[[:space:]]*//'
+}
+
+# ---------- timing ----------
+ms_now() {
+  if [ -n "${EPOCHREALTIME:-}" ]; then
+    awk -v t="$EPOCHREALTIME" 'BEGIN{printf "%.0f", t*1000}'
+  else
+    date +%s%3N 2>/dev/null || echo $(( $(date +%s) * 1000 ))
+  fi
+}
+
+# ---------- radio data ----------
+freq_band() { # -> "2.4 GHz" | "5 GHz" | "6 GHz" | "?"
+  local f="${1:-0}"
+  case "$f" in
+    ''|0) echo '?' ;;
+    *) if   [ "$f" -ge 2400 ] && [ "$f" -le 2500 ]; then echo '2.4 GHz'
+       elif [ "$f" -ge 5150 ] && [ "$f" -le 5895 ]; then echo '5 GHz'
+       elif [ "$f" -ge 5925 ] && [ "$f" -le 7125 ]; then echo '6 GHz'
+       else echo '?'; fi ;;
+  esac
+}
+
+freq_channel() { # -> channel number or "?"
+  local f="${1:-0}"
+  case "$f" in
+    ''|0) echo '?' ;;
+    *) if   [ "$f" -ge 2400 ] && [ "$f" -le 2500 ]; then echo $(( (f - 2407) / 5 ))
+       elif [ "$f" -ge 5150 ] && [ "$f" -le 5895 ]; then echo $(( (f - 5000) / 5 ))
+       elif [ "$f" -ge 5925 ] && [ "$f" -le 7125 ]; then echo $(( (f - 5950) / 5 ))
+       else echo '?'; fi ;;
+  esac
+}
+
+rssi_word() { # -> Excellent | Good | Fair | Weak | ?
+  local r="${1:-0}"
+  case "$r" in
+    ''|0) echo '?' ;;
+    *) if   [ "$r" -ge -50 ]; then echo 'Excellent'
+       elif [ "$r" -ge -60 ]; then echo 'Good'
+       elif [ "$r" -ge -70 ]; then echo 'Fair'
+       else echo 'Weak'; fi ;;
+  esac
+}
+
+rssi_marks() { printf 'Excellent ≥-50 · Good ≥-60 · Fair ≥-70 · Weak <-70 dBm\n'; }
+
+have_termux_api() { have termux-wifi-connectioninfo; }
+
+HAS5G=0   # number of 5 GHz APs seen by the last scan
+
+# Collect link state into globals. Returns 1 if nothing could be read.
+read_link() {
+  local raw=''
+  L_SSID=''; L_BSSID=''; L_FREQ=''; L_PHY=''; L_RSSI=''; L_IP=''; L_SRC=''
+
+  if [ -n "${EIWIFI_FAKE_LINK_JSON:-}" ]; then
+    raw="$EIWIFI_FAKE_LINK_JSON"; L_SRC='injected'
+  elif have_termux_api; then
+    raw="$(termux-wifi-connectioninfo 2>/dev/null)"; L_SRC='termux-api'
+  else
+    raw=''
+  fi
+
+  if [ -n "$raw" ]; then
+    L_SSID="$(printf '%s' "$raw"  | json_str ssid)"
+    L_BSSID="$(printf '%s' "$raw" | json_str bssid)"
+    L_FREQ="$(printf '%s' "$raw"  | json_num frequency_mhz)"
+    L_PHY="$(printf '%s' "$raw"   | json_num link_speed_mbps)"
+    L_RSSI="$(printf '%s' "$raw"  | json_num rssi)"
+    L_IP="$(printf '%s' "$raw"    | json_str ip)"
+  fi
+
+  # Fallback: kernel wireless table (signal only, no SSID/BSSID/frequency).
+  if [ -z "$L_RSSI" ] && [ -r /proc/net/wireless ]; then
+    local line
+    line="$(awk -v i="$WLAN_IF" '$1 ~ i {print; exit}' /proc/net/wireless)"
+    if [ -n "$line" ]; then
+      L_RSSI="$(printf '%s' "$line" | awk '{print $4}' | tr -d '.')"
+      [ -z "$L_SRC" ] && L_SRC='procfs'
+    fi
+  fi
+
+  [ -z "$L_IP" ] && L_IP="$(ip -4 addr show "$WLAN_IF" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)"
+  L_GW="$(ip route 2>/dev/null | awk '/^default/{print $3; exit}')"
+
+  case "$L_RSSI" in ''|*[!0-9-]*) L_RSSI='' ;; esac
+  case "$L_PHY"  in ''|*[!0-9.]*) L_PHY=''  ;; esac
+  case "$L_FREQ" in ''|*[!0-9]*)  L_FREQ='' ;; esac
+  : "${L_GW:=}"
+
+  [ -n "$L_SSID$L_RSSI$L_IP" ]
+}
+
+# Visible neighbours, one "ssid|bssid|freq|rssi" per line.
+read_scan() {
+  local raw=''
+  if [ -n "${EIWIFI_FAKE_SCAN_JSON:-}" ]; then
+    raw="$EIWIFI_FAKE_SCAN_JSON"
+  elif have termux-wifi-scaninfo; then
+    raw="$(termux-wifi-scaninfo 2>/dev/null)"
+  fi
+  [ -z "$raw" ] && return 1
+
+  # command substitution strips trailing newlines, so the final chunk arrives
+  # unterminated - the `|| [ -n "$obj" ]` guard is what keeps the last AP.
+  printf '%s' "$raw" | tr -d '\n' | tr '{' '\n' | while IFS= read -r obj || [ -n "$obj" ]; do
+    case "$obj" in *'"ssid"'*|*'"SSID"'*) ;; *) continue ;; esac
+    s="$(printf '%s' "$obj" | json_str ssid)"
+    b="$(printf '%s' "$obj" | json_str bssid)"
+    f="$(printf '%s' "$obj" | json_num frequency_mhz)"
+    r="$(printf '%s' "$obj" | json_num rssi)"
+    [ -z "$f" ] && f=0
+    [ -z "$r" ] && r=0
+    printf '%s|%s|%s|%s\n' "${s:-(hidden)}" "${b:-?}" "$f" "$r"
+  done
+}
+
+# ---------- latency ----------
+ping_stats() { # host [count] -> "min avg max loss%" or empty
+  local host="$1" count="${2:-6}" out
+  have ping || return 1
+  out="$(ping -c "$count" -W 2 "$host" 2>/dev/null)"
+  [ -z "$out" ] && return 1
+  printf '%s' "$out" | awk '
+    /min\/avg\/max/ {
+      split($0, p, "="); gsub(/[^0-9.\/]/, "", p[2])
+      n = split(p[2], v, "/"); if (n >= 3) { mn = v[1]; av = v[2]; mx = v[3] }
+    }
+    /packet loss/ { for (i = 1; i <= NF; i++) if ($i ~ /%$/) { gsub(/%/, "", $i); ls = $i } }
+    END { if (av == "") exit 1; printf "%s %s %s %s", mn, av, mx, (ls == "" ? 100 : ls) }'
+}
+
+tcp_probe_ms() { # host port -> connect time in ms
+  local t0 t1
+  t0="$(ms_now)"
+  (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null && exec 3<&- 3>&-
+  t1="$(ms_now)"
+  printf '%s' "$(( t1 - t0 ))"
+}
+
+probe_rtt() { # host port -> average ms (ping if possible, else TCP connect x3)
+  local host="$1" port="${2:-443}" stats avg total i t
+  if stats="$(ping_stats "$host" 6)"; then
+    avg="$(printf '%s' "$stats" | awk '{print $2}')"
+    printf '%s' "$avg"
+    return 0
+  fi
+  [ -z "$host" ] && return 1
+  total=0
+  for i in 1 2 3; do
+    t="$(tcp_probe_ms "$host" "$port")" || return 1
+    total=$(( total + t ))
+  done
+  printf '%s' "$(( total / 3 ))"
+}
+
+# ---------- throughput ----------
+discover_targets() { # N -> urls on stdout
+  local want="${1:-5}" json urls n
+  json="$(curl -sS -m 15 \
+    "https://api.fast.com/netflix/speedtest/v2?https=true&token=${FAST_TOKEN}&urlCount=10" 2>/dev/null)"
+  urls="$(printf '%s' "$json" | grep -oE '"url":"[^"]+"' | sed -E 's/^"url":"//; s/"$//')"
+  n="$(printf '%s' "$urls" | grep -c . )"
+  printf '%s\n' "$urls" | head -n "$want"
+  if [ "$n" -lt "$want" ]; then
+    local i=0
+    while [ "$i" -lt $(( want - n )) ]; do
+      printf '%s\n' "${FALLBACK_TARGETS[$(( i % ${#FALLBACK_TARGETS[@]} ))]}"
+      i=$(( i + 1 ))
+    done
+  fi
+}
+FALLBACK_TARGETS=(
+  'https://speedtest.singapore.linode.com/100MB-singapore.bin'
+  'https://speedtest.tokyo2.linode.com/100MB-tokyo2.bin'
+  'https://speed.cloudflare.com/__down?bytes=100000000'
+)
+
+# Parallel download, sum the per-stream byte rates. Prints "total_mbps stream_list"
+run_speed() {
+  local streams="${1:-5}" secs="${2:-15}" tmph i f url total b line out=''
+  tmph="$(mktemp -d 2>/dev/null)" || return 1
+  mapfile -t urls < <(discover_targets "$streams")
+  if [ "${#urls[@]}" -eq 0 ]; then rm -rf "$tmph"; return 1; fi
+
+  i=0
+  for url in "${urls[@]}"; do
+    i=$(( i + 1 ))
+    ( curl -s -o /dev/null -m "$secs" -w '%{speed_download}' "$url" >"$tmph/$i" 2>/dev/null ) &
+  done
+  wait
+
+  total=0
+  for f in "$tmph"/*; do
+    b="$(cat "$f" 2>/dev/null || echo 0)"
+    case "$b" in ''|*[!0-9.]*) b=0 ;; esac
+    total="$(awk -v t="$total" -v b="$b" 'BEGIN{printf "%.0f", t+b}')"
+    out="$out$(awk -v b="$b" 'BEGIN{printf "%.1f", b*8/1e6}') "
+  done
+  rm -rf "$tmph"
+  awk -v t="$total" -v s="$out" 'BEGIN{printf "%.2f %s", t*8/1e6, s}'
+}
+
+# ---------- verdict ----------
+# Args: band phy rssi mbps gw_rtt inet_rtt loaded_rtt has5g
+verdict() {
+  local band="$1" phy="$2" rssi="$3" mbps="$4" gw="$5" net="$6" loaded="$7" has5g="$8"
+  local eff='' findings=0
+
+  if [ -n "$phy" ] && [ -n "$mbps" ]; then
+    eff="$(awk -v p="$phy" -v m="$mbps" 'BEGIN{ if (p>0) printf "%.2f", m/p; else print 0 }')"
+  fi
+
+  if [ "$band" = '2.4 GHz' ]; then
+    bad "You are on 2.4 GHz — that band realistically tops out near 100–150 Mbps, no matter your plan."
+    info "  5 GHz APs visible from here: ${has5g:-unknown}"
+    findings=$(( findings + 1 ))
+  fi
+
+  if [ -n "$rssi" ] && [ "$rssi" -le -70 ] 2>/dev/null; then
+    warn "Signal is weak ($rssi dBm, $(rssi_word "$rssi")). Move closer to the router, or raise it."
+    findings=$(( findings + 1 ))
+  fi
+
+  if [ -n "$eff" ]; then
+    if awk -v e="$eff" 'BEGIN{exit !(e >= 0.6)}'; then
+      ok "Throughput is ${eff}x the ${phy} Mbps link rate — the radio is the ceiling here, not the internet."
+      findings=$(( findings + 1 ))
+    elif awk -v e="$eff" 'BEGIN{exit !(e < 0.5)}'; then
+      if [ -n "$gw" ] && [ "$gw" -lt 20 ] 2>/dev/null; then
+        ok "Link carries ${phy} Mbps, you pulled ${mbps} Mbps (${eff}x), and the router answers in ${gw} ms."
+        info "  The internet side is the bottleneck."
+      else
+        warn "Router round-trip is ${gw:-?} ms — the local WiFi path is struggling before the internet."
+      fi
+      findings=$(( findings + 1 ))
+    fi
+  fi
+
+  if [ -n "$net" ] && [ -n "$loaded" ]; then
+    if awk -v a="$net" -v b="$loaded" 'BEGIN{exit !(b > a*2.5 && b > 120)}'; then
+      warn "Bufferbloat: ${net} ms idle → ${loaded} ms under load. Interactive use will feel sticky."
+      findings=$(( findings + 1 ))
+    fi
+  fi
+
+  [ "$findings" -eq 0 ] && ok "Nothing obviously broken: the link, the router and the internet path all look consistent."
+  return 0
+}
+
+prescribe() {
+  local band="$1" has5g="$2" hasapi="$3"
+  printf '\n%sDO THIS%s\n' "$C_B" "$C_R"
+
+  local n=1
+  if [ "$band" = '2.4 GHz' ]; then
+    printf '  %d. Put this device on 5 GHz.\n' "$n"; n=$(( n + 1 ))
+    info "     Router admin → WiFi → 5 GHz band: give it its OWN SSID (e.g. MyWiFi_5G)."
+    info "     Band-steering on one shared SSID is what parks phones on 2.4 GHz."
+  fi
+  if [ "$has5g" = '0' ]; then
+    printf '  %d. No 5 GHz network is visible at all — the 5 GHz radio is off or unconfigured.\n' "$n"; n=$(( n + 1 ))
+    info "     Router admin → WiFi → enable the 5 GHz band, 80 MHz width, WPA2/WPA3-AES."
+  fi
+  printf '  %d. On the phone: Settings → Developer options → turn OFF "Wi-Fi scan throttling".\n' "$n"; n=$(( n + 1 ))
+  printf '  %d. Battery: set "Unrestricted" for whatever app you test with, and turn off\n' "$n"; n=$(( n + 1 ))
+  info "     'Adaptive Wi-Fi' / 'Wi-Fi power saving' if your vendor has it."
+  printf '  %d. Router: channel width 80 MHz on 5 GHz, WMM on, TKIP off, and QoS off while measuring.\n' "$n"; n=$(( n + 1 ))
+  printf '  %d. Speed-test hygiene: same spot, same server, 3 runs, ignore the best and worst.\n' "$n"
+  if [ "$hasapi" != '1' ]; then
+    printf '\n  %sInstall Termux:API for full link data:%s pkg install termux-api  (plus the Termux:API app)\n' "$C_D" "$C_R"
+  fi
+  printf '\n  %sAn unprivileged Android app cannot change radio settings — no tool can. This finds the cause; the router applies the cure.%s\n' "$C_D" "$C_R"
+}
+
+# ---------- commands ----------
+cmd_link() {
+  sect 1 LINK
+  if ! read_link; then
+    bad 'Cannot read WiFi state. Install Termux:API (pkg install termux-api + the Termux:API app).'
+    return 1
+  fi
+  local band ch
+  band="$(freq_band "$L_FREQ")"
+  ch="$(freq_channel "$L_FREQ")"
+  kv SSID       "${L_SSID:-unknown}"
+  kv BSSID      "${L_BSSID:-unknown}"
+  if [ -n "$L_FREQ" ]; then
+    kv Band       "$band  (channel $ch, ${L_FREQ} MHz)"
+  else
+    kv Band       'unknown (needs Termux:API)'
+  fi
+  if [ -n "$L_PHY" ]; then kv 'Link rate' "${L_PHY} Mbps  (PHY — the ceiling, not your speed)";
+  else kv 'Link rate' 'unknown'; fi
+  if [ -n "$L_RSSI" ]; then kv Signal "${L_RSSI} dBm — $(rssi_word "$L_RSSI")"; else kv Signal 'unknown'; fi
+  kv 'IP'       "${L_IP:-unknown}"
+  kv Gateway    "${L_GW:-unknown}"
+  [ -n "$L_SRC" ] && printf '  %s(source: %s)%s\n' "$C_D" "$L_SRC" "$C_R"
+  [ -z "$L_FREQ" ] && rssi_marks
+  return 0
+}
+
+cmd_scan() {
+  sect 2 NEIGHBOURHOOD
+  local scan
+  if ! scan="$(read_scan)" || [ -z "$scan" ]; then
+    warn 'No scan data. Install Termux:API (pkg install termux-api + the Termux:API app).'
+    warn 'Android also throttles scans to ~4 per 2 minutes unless you disable it in Developer options.'
+    return 1
+  fi
+  local n24 n5 n6
+  n24="$(printf '%s\n' "$scan" | awk -F'|' '$3>=2400 && $3<=2500' | grep -c .)"
+  n5="$(printf '%s\n' "$scan"  | awk -F'|' '$3>=5150 && $3<=5895' | grep -c .)"
+  n6="$(printf '%s\n' "$scan"  | awk -F'|' '$3>=5925 && $3<=7125' | grep -c .)"
+  HAS5G="$n5"
+  kv '2.4 GHz' "$n24 AP(s)"
+  kv '5 GHz'   "$n5 AP(s)"
+  [ "$n6" -gt 0 ] && kv '6 GHz' "$n6 AP(s)"
+
+  if [ "$n24" -gt 0 ]; then
+    printf '\n  %s2.4 GHz channels in use%s\n' "$C_B" "$C_R"
+    printf '%s\n' "$scan" | awk -F'|' '$3>=2400 && $3<=2500 {ch=int(($3-2407)/5+0.5); if(ch<1||ch>14)ch="?"; printf "    ch%-3s %4s dBm  %s\n", ch, $4, $1}' | sort -k1,1
+    printf '  %sOnly 1, 6 and 11 do not overlap — pick whichever of those has the least traffic.%s\n' "$C_D" "$C_R"
+  fi
+  if [ "$n5" -gt 0 ]; then
+    printf '\n  %s5 GHz channels in use%s\n' "$C_B" "$C_R"
+    printf '%s\n' "$scan" | awk -F'|' '$3>=5150 && $3<=5895 {ch=int(($3-5000)/5+0.5); printf "    ch%-4s %4s dBm  %s\n", ch, $4, $1}' | sort -k1,1 | head -20
+    printf '  %sOn 5 GHz prefer the UNII-3 channels (149–165) — they allow full transmit power.%s\n' "$C_D" "$C_R"
+  fi
+  [ "$n5" -eq 0 ] && warn 'No 5 GHz networks visible — enable the 5 GHz radio on the router.'
+  return 0
+}
+
+cmd_ping() {
+  sect 3 LATENCY
+  local gw="${1:-${L_GW:-192.168.0.1}}"
+  local stats avg
+  if stats="$(ping_stats "$gw" 8)"; then
+    kv 'Router' "$(printf '%s' "$stats" | awk '{printf "%s ms avg (min %s, max %s), loss %s%%", $2, $1, $3, $4}')"
+  else
+    avg="$(probe_rtt "$gw" 80)"
+    [ -n "$avg" ] && kv 'Router' "${avg} ms (TCP connect)"
+  fi
+  for h in 1.1.1.1 8.8.8.8; do
+    if stats="$(ping_stats "$h" 8)"; then
+      kv "$h" "$(printf '%s' "$stats" | awk '{printf "%s ms avg, loss %s%%", $2, $4}')"
+      break
+    fi
+  done
+  return 0
+}
+
+cmd_speed() {
+  local streams="${1:-5}" secs="${2:-15}" res total per
+  sect 4 SPEED
+  info "fast.com-equivalent: $streams parallel streams, ${secs}s window"
+  res="$(run_speed "$streams" "$secs")" || { bad 'Speed test failed — check curl and connectivity (pkg install curl).'; return 1; }
+  total="${res%% *}"; per="${res#* }"
+  printf '  %s%s%s %sMbps%s   (fast.com reports the same way — several streams at once)\n' \
+    "$C_B" "$total" "$C_R" "$C_D" "$C_R"
+  printf '  %sper stream: %sMbps%s\n' "$C_D" "$per" "$C_R"
+  printf '  %sRESULT mbps=%s streams=%s secs=%s%s\n' "$C_D" "$total" "$streams" "$secs" "$C_R"
+  return 0
+}
+
+cmd_check() {
+  sect 0 ENVIRONMENT
+  if [ -d "$PREFIX" ] || [ "${EIWIFI_FORCE_TERMUX:-0}" = '1' ]; then
+    ok "Termux detected (PREFIX=$PREFIX)"
+  else
+    warn 'Not running on Termux — radio data will be unavailable, the rest still works.'
+  fi
+  have curl     && ok 'curl present'              || bad 'curl missing  → pkg install curl'
+  have ping     && ok 'ping present'              || warn 'ping missing  → pkg install iputils (TCP fallback will be used)'
+  have_termux_api && ok 'termux-api present'      || warn 'termux-api missing → pkg install termux-api (+ install the Termux:API app)'
+  have ip       && ok 'ip present'                || warn 'ip missing    → pkg install iproute2'
+  return 0
+}
+
+cmd_report() {
+  version_banner
+  cmd_link
+  cmd_scan || true
+
+  sect 3 LATENCY
+  local gw="${L_GW:-192.168.0.1}" gw_rtt='' net_rtt='' stats
+  if [ -n "${EIWIFI_FAKE_GW_RTT:-}" ]; then
+    gw_rtt="$EIWIFI_FAKE_GW_RTT"; kv 'Router' "${gw_rtt} ms avg"
+  elif stats="$(ping_stats "$gw" 6)"; then
+    gw_rtt="$(printf '%s' "$stats" | awk '{print $2}')"
+    kv 'Router' "$(printf '%s' "$stats" | awk '{printf "%s ms avg, loss %s%%", $2, $4}')"
+  else
+    gw_rtt="$(probe_rtt "$gw" 80)"
+    [ -n "$gw_rtt" ] && kv 'Router' "${gw_rtt} ms (TCP connect)"
+  fi
+  if [ -n "${EIWIFI_FAKE_INET_RTT:-}" ]; then
+    net_rtt="$EIWIFI_FAKE_INET_RTT"; kv 'Internet' "${net_rtt} ms avg"
+  else
+    net_rtt="$(probe_rtt 1.1.1.1 443)"
+    [ -n "$net_rtt" ] && kv 'Internet' "${net_rtt} ms avg"
+  fi
+
+  sect 4 SPEED
+  local res mbps='' loaded='' loader=''
+  if [ -n "${EIWIFI_FAKE_MBPS:-}" ]; then
+    mbps="$EIWIFI_FAKE_MBPS"
+    printf '  5 parallel streams → %s%s Mbps%s %s(injected)%s\n' "$C_B" "$mbps" "$C_R" "$C_D" "$C_R"
+    printf '  %sRESULT mbps=%s streams=5 secs=15%s\n' "$C_D" "$mbps" "$C_R"
+  elif res="$(run_speed 5 15)"; then
+    mbps="${res%% *}"
+    printf '  5 parallel streams → %s%s Mbps%s\n' "$C_B" "$mbps" "$C_R"
+    printf '  %sper stream: %sMbps%s\n' "$C_D" "${res#* }" "$C_R"
+    printf '  %sRESULT mbps=%s streams=5 secs=15%s\n' "$C_D" "$mbps" "$C_R"
+  else
+    warn 'Speed test failed (needs curl + a working connection).'
+  fi
+
+  if [ -n "$mbps" ]; then
+    if [ -n "${EIWIFI_FAKE_LOADED_RTT:-}" ]; then
+      loaded="$EIWIFI_FAKE_LOADED_RTT"
+    else
+      printf '  %smeasuring latency under load…%s\n' "$C_D" "$C_R"
+      ( run_speed 3 12 >/dev/null 2>&1 ) &
+      loader=$!
+      sleep 4
+      loaded="$(probe_rtt 1.1.1.1 443)"
+      wait "$loader" 2>/dev/null || true
+    fi
+    [ -n "$loaded" ] && kv 'Loaded' "${loaded} ms avg"
+  fi
+
+  local band has5g
+  band="$(freq_band "$L_FREQ")"
+  has5g="${HAS5G:-1}"
+  [ -n "${EIWIFI_FAKE_HAS5G:-}" ] && has5g="$EIWIFI_FAKE_HAS5G"
+  [ -n "${EIWIFI_FAKE_BAND:-}" ] && band="$EIWIFI_FAKE_BAND"
+
+  sect 5 VERDICT
+  verdict "$band" "${L_PHY}" "${L_RSSI}" "${EIWIFI_FAKE_MBPS:-$mbps}" \
+          "${gw_rtt}" "${net_rtt}" "${loaded}" "$has5g"
+
+  prescribe "$band" "$has5g" "$(have_termux_api && echo 1 || echo 0)"
+  printf '\n'
+}
+
+usage() {
+  cat <<EOF
+$PROG $VERSION — Android/Termux WiFi doctor
+
+Usage: $PROG [command] [args]
+
+Commands:
+  report            full run: link, neighbourhood, latency, speed, verdict   (default)
+  link              radio state: band, channel, PHY rate, signal, gateway
+  scan              nearby APs, band split, channel congestion, best channel
+  ping [host]       latency to the router and the internet
+  speed [n] [secs]  parallel download test (fast.com-equivalent), default 5 x 15s
+  check             dependencies and environment
+  version           print version
+  help              this text
+
+Examples:
+  $PROG
+  $PROG speed 8 20
+  $PROG ping 192.168.0.1
+
+Notes:
+  · The PHY "link rate" is the radio's ceiling, not your internet speed.
+  · Without the Termux:API app, band/channel/signal cannot be read (Android limitation).
+  · No unprivileged app can change the radio. This measures and prescribes.
+EOF
+}
+
+main() {
+  local cmd="${1:-report}"; [ $# -gt 0 ] && shift || true
+  case "$cmd" in
+    report|'')        cmd_report "$@" ;;
+    link)             version_banner; cmd_link ;;
+    scan)             version_banner; cmd_scan ;;
+    ping)             version_banner; read_link || true; cmd_ping "$@" ;;
+    speed)            version_banner; cmd_speed "$@" ;;
+    check)            version_banner; cmd_check ;;
+    version|-V|--version) printf '%s %s\n' "$PROG" "$VERSION" ;;
+    help|-h|--help)   usage ;;
+    *) printf '%s: unknown command "%s"\n\n' "$PROG" "$cmd" >&2; usage; exit 2 ;;
+  esac
+}
+
+main "$@"
