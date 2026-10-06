@@ -152,7 +152,16 @@ read_scan() {
   if [ -n "${EIWIFI_FAKE_SCAN_JSON:-}" ]; then
     raw="$EIWIFI_FAKE_SCAN_JSON"
   elif have termux-wifi-scaninfo; then
-    raw="$(termux-wifi-scaninfo 2>/dev/null)"
+    # Android throttles WiFi scans hard: this call can sit for 5-20s with no
+    # output. Say so on stderr (stdout is the parsed data and must stay clean)
+    # and bound the wait so a stuck scan cannot hang the whole report.
+    printf '  scanning for access points (Android throttles this, ~5-20s)…' >&2
+    if have timeout; then
+      raw="$(timeout "${EIWIFI_SCAN_TIMEOUT:-45}" termux-wifi-scaninfo 2>/dev/null)"
+    else
+      raw="$(termux-wifi-scaninfo 2>/dev/null)"
+    fi
+    if [ -t 2 ]; then printf '\r\033[K' >&2; else printf '\n' >&2; fi
   fi
   [ -z "$raw" ] && return 1
 
@@ -460,7 +469,6 @@ pick_min() { # [weight-column] lines on stdin -> the one with the smallest weigh
 
 cmd_tune() {
   sect 6 TUNE '— preset for this exact location'
-  read_link || true
   local scan
   if ! scan="$(read_scan)" || [ -z "$scan" ]; then
     warn 'Needs a scan to pick channels. Install Termux:API (pkg install termux-api + the Termux:API app).'

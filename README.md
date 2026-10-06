@@ -67,7 +67,12 @@ spread:
 - **swings widely** → congestion or time-of-day load. Test again at another hour before
   concluding anything, and before spending money.
 
-Flags/hooks: `NO_COLOR=1` disables colour, `EIWIFI_IF=wlan0` picks the interface.
+Flags/hooks: `NO_COLOR=1` disables colour, `EIWIFI_IF=wlan0` picks the interface,
+`EIWIFI_SCAN_TIMEOUT=45` bounds the AP scan.
+
+Android throttles WiFi scans to roughly 4 per 2 minutes, so the scan step can sit there for
+5–20 seconds. `eiwifi` prints a notice on **stderr** (stdout stays machine-parseable) and bounds
+the wait — a stuck scan degrades to "no scan data" instead of hanging the whole report.
 
 ## Reading the output
 
@@ -131,7 +136,7 @@ instead of an evening of guessing — and it would have told you the same thing 
 bash tests/test-eiwifi.sh
 ```
 
-72 assertions covering JSON parsing (including the last-array-element trap), band/channel maths,
+77 assertions covering JSON parsing (including the last-array-element trap), band/channel maths,
 channel-congestion scoring, signal grading, degraded/vendor-specific fixtures, and all four
 verdict branches. The scoring functions are sourced from the real script and unit-tested
 directly, and the tie-breaking is checked for determinism. Termux:API

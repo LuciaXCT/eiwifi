@@ -26,6 +26,7 @@ EOF
 cat >"$STUB/termux-wifi-scaninfo" <<'EOF'
 #!/usr/bin/env bash
 if [ "${EIWIFI_TEST_SCAN_FAIL:-0}" = 1 ]; then exit 0; fi
+if [ "${EIWIFI_TEST_SCAN_SLOW:-0}" = 1 ]; then sleep 30; fi
 echo '[{"bssid":"b8:d4:bc:87:52:00","frequency_mhz":2437,"rssi":-54,"ssid":"ZTE_875200","timestamp":1},
 {"bssid":"b8:d4:bc:91:52:00","frequency_mhz":5745,"rssi":-72,"ssid":"ZTE_875200","timestamp":1},
 {"bssid":"aa:bb:cc:dd:ee:01","frequency_mhz":2412,"rssi":-80,"ssid":"Neighbour","timestamp":1},
@@ -110,6 +111,23 @@ check "neighbour shown" "Neighbour" "$out"
 echo '== scan with no data =='
 out="$(EIWIFI_TEST_SCAN_FAIL=1 run scan)"
 check "warns when scan empty" "No scan data" "$out"
+
+echo '== scan progress goes to stderr, never stdout =='
+# call the script directly here: run() merges stderr into stdout, which would
+# make a stdout-purity test pass no matter what the script did.
+scan_stdout="$("$SCRIPT" scan 2>/dev/null)"
+scan_stderr="$("$SCRIPT" scan 2>&1 >/dev/null)"
+check     "progress notice is on stderr"    "scanning for access points" "$scan_stderr"
+check_not "no chatter on stdout"            "scanning"                   "$scan_stdout"
+check     "stdout still parses"             "AP(s)"                      "$scan_stdout"
+
+echo '== a hung scan is bounded, not fatal =='
+t0="$(date +%s)"
+out="$(EIWIFI_TEST_SCAN_SLOW=1 EIWIFI_SCAN_TIMEOUT=2 "$SCRIPT" scan 2>/dev/null)"; st=$?
+t1="$(date +%s)"; elapsed=$(( t1 - t0 ))
+check "hung scan times out" "No scan data" "$out"
+if [ "$elapsed" -lt 20 ]; then printf '  ok   scan aborted in %ss, not 30s\n' "$elapsed"; PASS=$((PASS+1))
+else printf '  FAIL scan took %ss - timeout not applied\n' "$elapsed"; FAIL=$((FAIL+1)); fi
 
 echo '== verdict: 2.4 GHz, internet-limited =='
 out="$(EIWIFI_TEST_FIXTURE=24g EIWIFI_FAKE_MBPS=90 EIWIFI_FAKE_GW_RTT=3 \
