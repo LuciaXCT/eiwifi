@@ -111,7 +111,15 @@ read_link() {
   if [ -n "${EIWIFI_FAKE_LINK_JSON:-}" ]; then
     raw="$EIWIFI_FAKE_LINK_JSON"; L_SRC='injected'
   elif have_termux_api; then
-    raw="$(termux-wifi-connectioninfo 2>/dev/null)"; L_SRC='termux-api'
+    # Android can block this call indefinitely (location service / permission
+    # state), so bound it: a stuck call degrades to the procfs + ip fallbacks
+    # below instead of hanging `link` until the user hits Ctrl-C.
+    if have timeout; then
+      raw="$(timeout "${EIWIFI_LINK_TIMEOUT:-10}" termux-wifi-connectioninfo 2>/dev/null)"
+    else
+      raw="$(termux-wifi-connectioninfo 2>/dev/null)"
+    fi
+    [ -n "$raw" ] && L_SRC='termux-api'
   else
     raw=''
   fi

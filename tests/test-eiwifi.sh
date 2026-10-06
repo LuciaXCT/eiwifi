@@ -14,6 +14,7 @@ trap cleanup EXIT
 # ---------- stubs ----------
 cat >"$STUB/termux-wifi-connectioninfo" <<'EOF'
 #!/usr/bin/env bash
+if [ "${EIWIFI_TEST_LINK_SLOW:-0}" = 1 ]; then sleep 30; fi
 case "${EIWIFI_TEST_FIXTURE:-5g}" in
   5g)  echo '{"BSSID":"b8:d4:bc:91:52:00","SSID":"ZTE_875200","supplicant_state":"COMPLETED","rssi":-72,"link_speed_mbps":325,"frequency_mhz":5745,"ip":"192.168.0.42","mac_address":"aa:f6:f0:58:6f:3f","hidden_ssid":false,"network_id":0}' ;;
   24g) echo '{"BSSID":"b8:d4:bc:87:52:00","SSID":"ZTE_875200","rssi":-54,"link_speed_mbps":300,"frequency_mhz":2437,"ip":"192.168.0.8","hidden_ssid":false,"network_id":0}' ;;
@@ -128,6 +129,15 @@ t1="$(date +%s)"; elapsed=$(( t1 - t0 ))
 check "hung scan times out" "No scan data" "$out"
 if [ "$elapsed" -lt 20 ]; then printf '  ok   scan aborted in %ss, not 30s\n' "$elapsed"; PASS=$((PASS+1))
 else printf '  FAIL scan took %ss - timeout not applied\n' "$elapsed"; FAIL=$((FAIL+1)); fi
+
+echo '== a hung connectioninfo is bounded, not fatal =='
+# call directly: run() merges stderr, but here we only care that it returns fast
+t0="$(date +%s)"
+out="$(EIWIFI_TEST_LINK_SLOW=1 EIWIFI_LINK_TIMEOUT=2 "$SCRIPT" link 2>&1)"; st=$?
+t1="$(date +%s)"; elapsed=$(( t1 - t0 ))
+check "hung link degrades with guidance" "Cannot read WiFi state" "$out"
+if [ "$elapsed" -lt 20 ]; then printf '  ok   link aborted in %ss, not 30s\n' "$elapsed"; PASS=$((PASS+1))
+else printf '  FAIL link took %ss - timeout not applied\n' "$elapsed"; FAIL=$((FAIL+1)); fi
 
 echo '== verdict: 2.4 GHz, internet-limited =='
 out="$(EIWIFI_TEST_FIXTURE=24g EIWIFI_FAKE_MBPS=90 EIWIFI_FAKE_GW_RTT=3 \

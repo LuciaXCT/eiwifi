@@ -68,11 +68,15 @@ spread:
   concluding anything, and before spending money.
 
 Flags/hooks: `NO_COLOR=1` disables colour, `EIWIFI_IF=wlan0` picks the interface,
-`EIWIFI_SCAN_TIMEOUT=45` bounds the AP scan.
+`EIWIFI_SCAN_TIMEOUT=45` bounds the AP scan, `EIWIFI_LINK_TIMEOUT=10` bounds the link query.
 
 Android throttles WiFi scans to roughly 4 per 2 minutes, so the scan step can sit there for
 5–20 seconds. `eiwifi` prints a notice on **stderr** (stdout stays machine-parseable) and bounds
 the wait — a stuck scan degrades to "no scan data" instead of hanging the whole report.
+
+The link query (`termux-wifi-connectioninfo`) can likewise block if the location service or
+Termux:API permission is in a bad state — so `link` is bounded too (`EIWIFI_LINK_TIMEOUT`,
+default 10s) and falls back to the kernel/IP data rather than hanging until you press Ctrl-C.
 
 ## Reading the output
 
