@@ -23,7 +23,13 @@ else
 fi
 
 hr()   { printf '%s\n' "${C_D}────────────────────────────────────────────────────────────${C_R}"; }
-sect() { printf '\n%s[%s]%s %s\n' "$C_B" "$1" "$C_R" "$2"; }
+sect() {
+  if [ -n "${3:-}" ]; then
+    printf '\n%s[%s]%s %s  %s%s%s\n' "$C_B" "$1" "$C_R" "$2" "$C_D" "$3" "$C_R"
+  else
+    printf '\n%s[%s]%s %s\n' "$C_B" "$1" "$C_R" "$2"
+  fi
+}
 ok()   { printf '  %s✓%s %s\n' "$C_G" "$C_R" "$*"; }
 warn() { printf '  %s!%s %s\n' "$C_Y" "$C_R" "$*"; }
 bad()  { printf '  %s✗%s %s\n' "$C_RD" "$C_R" "$*"; }
@@ -412,6 +418,130 @@ cmd_speed() {
   return 0
 }
 
+# Score each candidate 2.4 GHz channel by the interference it would receive.
+# Weight = sum of (rssi+100) over every AP whose 20 MHz span overlaps the candidate
+# (a 20 MHz channel reaches +-4 channels either side). Lower is better.
+score_24() {
+  local scan="$1" cand w
+  for cand in 1 6 11; do
+    w="$(printf '%s\n' "$scan" | awk -F'|' -v c="$cand" '
+      $3 >= 2400 && $3 <= 2500 {
+        ch = int(($3 - 2407) / 5 + 0.5)
+        d = ch - c; if (d < 0) d = -d
+        if (d <= 4) { v = $4 + 100; if (v < 1) v = 1; s += v }
+      }
+      END { printf "%.0f", s + 0 }')"
+    printf '%s %s\n' "$cand" "$w"
+  done
+}
+
+# Score the two usable 80 MHz blocks on 5 GHz. UNII-1 (36-48) and UNII-3 (149-165).
+# Avoids the DFS range 52-144, which needs radar-clearance and can drop out.
+score_5() {
+  local scan="$1" a b w
+  for spec in '36 48' '149 165'; do
+    set -- $spec; a="$1"; b="$2"
+    w="$(printf '%s\n' "$scan" | awk -F'|' -v a="$a" -v b="$b" '
+      $3 >= 5150 && $3 <= 5895 {
+        ch = int(($3 - 5000) / 5 + 0.5)
+        if (ch >= a && ch <= b) { v = $4 + 100; if (v < 1) v = 1; s += v }
+      }
+      END { printf "%.0f", s + 0 }')"
+    printf '%s %s %s\n' "$a" "$b" "$w"
+  done
+}
+
+pick_min() { # [weight-column] lines on stdin -> the one with the smallest weight
+  # -s keeps the emission order when scores tie, so the choice is deterministic
+  # (e.g. two equally clear 5 GHz blocks always resolve to the same one).
+  local col="${1:-2}"
+  sort -s -k"$col","$col"n | head -1
+}
+
+cmd_tune() {
+  sect 6 TUNE '— preset for this exact location'
+  read_link || true
+  local scan
+  if ! scan="$(read_scan)" || [ -z "$scan" ]; then
+    warn 'Needs a scan to pick channels. Install Termux:API (pkg install termux-api + the Termux:API app).'
+    info 'Without it, use these defaults: 2.4 GHz channel 1/6/11 at 20 MHz, 5 GHz channel 149 at 80 MHz.'
+    return 1
+  fi
+
+  local b24 b5
+  b24="$(score_24 "$scan" | pick_min)"
+  b5="$(score_5 "$scan" | pick_min 3)"
+
+  printf '\n  %s2.4 GHz%s\n' "$C_B" "$C_R"
+  printf '    use channel %s   %s(scores — ch1 %s, ch6 %s, ch11 %s; lower is better)%s\n' \
+    "${b24%% *}" "$C_D" \
+    "$(score_24 "$scan" | awk '$1==1{print $2}')" \
+    "$(score_24 "$scan" | awk '$1==6{print $2}')" \
+    "$(score_24 "$scan" | awk '$1==11{print $2}')" "$C_R"
+  info '    width 20 MHz — 40 MHz on 2.4 GHz overlaps everything else on the band'
+
+  printf '\n  %s5 GHz%s\n' "$C_B" "$C_R"
+  printf '    use channel %s   %sUNII-3 80 MHz block (scores — 36-48: %s, 149-165: %s)%s\n' \
+    "${b5%% *}" "$C_D" \
+    "$(score_5 "$scan" | awk '$1==36{print $3}')" \
+    "$(score_5 "$scan" | awk '$1==149{print $3}')" "$C_R"
+  info '    width 80 MHz — and avoid 52-144 (DFS: radar detection can drop clients)'
+
+  printf '\n%sROUTER (open the admin page in a browser)%s\n' "$C_B" "$C_R"
+  info "  1. 5 GHz: give it its OWN SSID (e.g. ZTE_5G) — stop sharing one name with 2.4 GHz."
+  info "  2. 5 GHz: channel ${b5%% *}, width 80 MHz, WPA2/WPA3-AES (never TKIP)."
+  info "  3. 2.4 GHz: channel ${b24%% *}, width 20 MHz."
+  info '  4. WMM on, QoS/SQM off while measuring, then set SQM to ~90% of your real speed.'
+
+  printf '\n%sPHONE%s\n' "$C_B" "$C_R"
+  info '  5. Developer options -> turn OFF "Wi-Fi scan throttling".'
+  info '  6. Battery -> "Unrestricted" for your test app; disable Adaptive Wi-Fi / Wi-Fi power saving.'
+  info '  7. Forget the 2.4 GHz SSID so the phone stops drifting back to it.'
+
+  printf '\n%sTHEN MEASURE%s\n' "$C_B" "$C_R"
+  info '  eiwifi speed 5 15      (before/after, same spot, same server)'
+  info '  eiwifi watch           (is the number stable, or does it move with the time of day?)'
+  printf '\n  %sNo app can change the radio for you — these are the knobs, and the router is where they live.%s\n' "$C_D" "$C_R"
+  return 0
+}
+
+cmd_watch() {
+  local samples="${1:-5}" secs="${2:-10}" gap="${3:-3}" i res mbps
+  local -a vals=()
+  sect 7 WATCH "— $samples samples, ${secs}s each, ${gap}s apart"
+  info 'A stable number means a hard cap; a number that swings means congestion.'
+  printf '\n'
+
+  i=0
+  while [ "$i" -lt "$samples" ]; do
+    i=$(( i + 1 ))
+    res="$(run_speed 5 "$secs")" || { warn "sample $i failed"; [[ $i -lt $samples ]] && sleep "$gap"; continue; }
+    mbps="${res%% *}"
+    vals+=( "$mbps" )
+    printf '  sample %d/%d  %s%6s Mbps%s  %s(per stream %s)%s\n' \
+      "$i" "$samples" "$C_B" "$mbps" "$C_R" "$C_D" "${res#* }" "$C_R"
+    [ "$i" -lt "$samples" ] && sleep "$gap"
+  done
+
+  if [ "${#vals[@]}" -eq 0 ]; then
+    bad 'No samples completed — check connectivity (pkg install curl).'
+    return 1
+  fi
+
+  printf '%s\n' "${vals[@]}" | awk '
+    { v[NR] = $1; s += $1; if (NR == 1 || $1 < mn) mn = $1; if (NR == 1 || $1 > mx) mx = $1 }
+    END {
+      n = NR; av = s / n
+      printf "\n  min %.2f   avg %.2f   max %.2f Mbps   spread %.0f%%\n", mn, av, mx, (av > 0 ? (mx - mn) / av * 100 : 0)
+      if (av > 0 && (mx - mn) / av < 0.15)
+        printf "  Verdict: stable. A flat number like this is a hard cap — plan or uplink, not WiFi.\n"
+      else
+        printf "  Verdict: swings around. That is congestion or time-of-day load, not a fixed plan cap.\n"
+    }'
+  printf '\n  %sRun this at different hours before buying anything.  %s%s\n' "$C_D" "$PROG" " $C_R"
+  return 0
+}
+
 cmd_check() {
   sect 0 ENVIRONMENT
   if [ -d "$PREFIX" ] || [ "${EIWIFI_FORCE_TERMUX:-0}" = '1' ]; then
@@ -504,14 +634,17 @@ Commands:
   scan              nearby APs, band split, channel congestion, best channel
   ping [host]       latency to the router and the internet
   speed [n] [secs]  parallel download test (fast.com-equivalent), default 5 x 15s
+  tune              exact channel/width/SSID preset derived from your own scan
+  watch [n] [s] [gap]  repeat the speed test; tells a hard cap from congestion
   check             dependencies and environment
   version           print version
   help              this text
 
 Examples:
   $PROG
+  $PROG tune
+  $PROG watch 6 10
   $PROG speed 8 20
-  $PROG ping 192.168.0.1
 
 Notes:
   · The PHY "link rate" is the radio's ceiling, not your internet speed.
@@ -528,6 +661,8 @@ main() {
     scan)             version_banner; cmd_scan ;;
     ping)             version_banner; read_link || true; cmd_ping "$@" ;;
     speed)            version_banner; cmd_speed "$@" ;;
+    tune)             version_banner; cmd_tune ;;
+    watch)            version_banner; cmd_watch "$@" ;;
     check)            version_banner; cmd_check ;;
     version|-V|--version) printf '%s %s\n' "$PROG" "$VERSION" ;;
     help|-h|--help)   usage ;;

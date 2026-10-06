@@ -43,8 +43,29 @@ eiwifi link            # radio state only
 eiwifi scan            # nearby APs + best channel
 eiwifi ping [host]     # latency
 eiwifi speed [n] [s]   # parallel download test, e.g. eiwifi speed 8 20
+eiwifi tune            # exact channel/width/SSID preset from your own scan
+eiwifi watch [n] [s]   # repeat the speed test — hard cap, or congestion?
 eiwifi check           # dependencies
 ```
+
+### `eiwifi tune` — the knobs, filled in
+
+Scores every usable channel against the APs it can actually see and prints a preset you can
+copy into the router. It weights neighbours by how loud they are, picks the least-overlapped of
+1/6/11 on 2.4 GHz, and picks between the two usable 80 MHz blocks on 5 GHz (36–48 vs 149–165),
+skipping the DFS range 52–144 that radar detection can knock clients off.
+
+No app can apply these for you without root. This hands you the exact values so the router
+step takes two minutes instead of twenty.
+
+### `eiwifi watch` — cap, or congestion?
+
+"Maybe my limit is 100 Mbps" is answerable. `watch` samples the link repeatedly and reports
+spread:
+
+- **under ~15% spread** → a hard cap. Plan, uplink, or CPE. No WiFi setting touches it.
+- **swings widely** → congestion or time-of-day load. Test again at another hour before
+  concluding anything, and before spending money.
 
 Flags/hooks: `NO_COLOR=1` disables colour, `EIWIFI_IF=wlan0` picks the interface.
 
@@ -110,8 +131,10 @@ instead of an evening of guessing — and it would have told you the same thing 
 bash tests/test-eiwifi.sh
 ```
 
-41 assertions covering JSON parsing (including the last-array-element trap), band/channel maths,
-signal grading, degraded/vendor-specific fixtures, and all four verdict branches. Termux:API
+72 assertions covering JSON parsing (including the last-array-element trap), band/channel maths,
+channel-congestion scoring, signal grading, degraded/vendor-specific fixtures, and all four
+verdict branches. The scoring functions are sourced from the real script and unit-tested
+directly, and the tie-breaking is checked for determinism. Termux:API
 commands are stubbed, so the suite runs on any Linux box; measurements are injected via
 `EIWIFI_FAKE_*` env vars so results are deterministic.
 

@@ -144,6 +144,67 @@ check "clean bill of health" "all look consistent" "$out"
 check "strong signal not flagged" "Excellent" "$out"
 check "channel 161 on 5 GHz" "channel 161" "$out"
 
+echo '== tune (channel preset from the scan fixture) =='
+out="$(run tune)"
+# fixture APs: ch6 -54, ch1 -80 (2.4 GHz); ch149 -72, ch161 -85 (5 GHz)
+check "2.4 GHz picks least-overlapped ch11" "use channel 11" "$out"
+check "5 GHz picks the empty UNII-1 block"   "use channel 36" "$out"
+check "shows the 80 MHz choice"              "80 MHz" "$out"
+check "names the band blocks"                "UNII-3" "$out"
+check "warns off DFS"                        "52-144" "$out"
+check "tells you to split the SSID"          "OWN SSID" "$out"
+check "honest about app limits"              "No app can change the radio" "$out"
+check "points at watch"                      "eiwifi watch" "$out"
+
+out="$(EIWIFI_TEST_SCAN_FAIL=1 run tune)"
+check "tune degrades without a scan" "Needs a scan" "$out"
+
+# unit-test the scoring functions against the real script source, minus the
+# `main "$@"` line, so the channel maths is checked directly and not via output.
+LIB="$STUB/eiwifi-lib"
+sed '$d' "$SCRIPT" > "$LIB"
+# shellcheck disable=SC1090
+. "$LIB"
+
+f24="$(printf 'a|b|2437|-54\nc|d|2412|-80\ne|f|2462|-84')"
+check "score_24 ranks by weighted overlap" "11 16" "$(score_24 "$f24" | pick_min)"
+check "score_24 scores ch6 highest"        "6 46"  "$(score_24 "$f24" | awk '$1==6')"
+
+f5_clear="$(printf 'a|b|5745|-72\nc|d|5805|-85')"
+f5_busy="$(printf 'a|b|5180|-40\nc|d|5745|-72')"
+f5_dfs="$(printf 'a|b|5500|-40')"
+f24_empty="$(printf 'a|b|0|0')"
+
+# score_5 puts the weight in column 3, so pick_min must be told so
+check "score_5 prefers the empty block" "36 48 0" "$(score_5 "$f5_clear" | pick_min 3)"
+check "score_5 moves off a busy block" "149 165 28" "$(score_5 "$f5_busy" | pick_min 3)"
+check "score_5 ignores DFS-band APs" "36 48 0" "$(score_5 "$f5_dfs" | pick_min 3)"
+check "pick_min defaults to column 2" "11 16" "$(score_24 "$f24" | pick_min)"
+check "unknown-band APs score nothing" "3" "$(score_24 "$f24_empty" | awk '$2 == 0' | wc -l | tr -d ' ')"
+
+# 2437 -> ch6, 5180 -> ch36, 5745 -> ch149, 5805 -> ch161, 5500 -> ch100
+check "channel maths 2437->6"   "6"   "$(freq_channel 2437)"
+check "channel maths 5180->36"  "36"  "$(freq_channel 5180)"
+check "channel maths 5745->149" "149" "$(freq_channel 5745)"
+check "channel maths 5805->161" "161" "$(freq_channel 5805)"
+check "band maths 5500->5 GHz"  "5 GHz" "$(freq_band 5500)"
+check "band maths 5955->6 GHz"  "6 GHz" "$(freq_band 5955)"
+check "signal grading -45"      "Excellent" "$(rssi_word -45)"
+check "signal grading -55"      "Good"      "$(rssi_word -55)"
+check "signal grading -65"      "Fair"      "$(rssi_word -65)"
+check "signal grading -75"      "Weak"      "$(rssi_word -75)"
+
+echo '== watch (live, 2 samples x 4s) =='
+out="$(run watch 2 4 1)"; st=$?
+if [ "$st" -eq 0 ]; then printf '  ok   watch exit status 0\n'; PASS=$((PASS+1))
+else printf '  FAIL watch exit status %s\n' "$st"; FAIL=$((FAIL+1)); fi
+check "watch prints samples"     "sample 2/2" "$out"
+check "watch summarises"         "avg" "$out"
+check "watch gives a verdict"    "Verdict:" "$out"
+
+out="$(run watch 0 1 1)"
+check "watch handles zero samples" "No samples completed" "$out"
+
 echo '== speed (live, 3 streams x 5s) =='
 out="$(run speed 3 5)"
 check "speed returns a result line" "RESULT mbps=" "$out"
